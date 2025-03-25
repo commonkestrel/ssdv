@@ -1,0 +1,11 @@
+[package]
+name = "ssdv"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = "0.4.27"
+tinyvec = "1.9.0"
+
+[[example]]
+name = "basic"
