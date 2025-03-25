@@ -100,6 +100,8 @@ pub struct Encoder {
     acrle: u8,
     accrle: u8,
     mcupart: u8,
+    reset_mcu: u32,
+    next_reset_mcu: u32, 
     grayscale: bool,
     component: u8,
     ycparts: u8,
@@ -111,6 +113,9 @@ pub struct Encoder {
     mcu_mode: u8,
     mcu_id: u16,
     mcu_count: u16,
+    sdqt: [Option<Vec<u8>>; 2],
+    sdht: [[Option<Vec<u8>>; 2]; 2],
+    dri: u16,
 }
 
 impl Encoder {
@@ -145,6 +150,8 @@ impl Encoder {
             acrle: 0,
             accrle: 0,
             mcupart: 0,
+            reset_mcu: 0,
+            next_reset_mcu: 0,
             grayscale: false,
             component: 0,
             ycparts: 0,
@@ -156,6 +163,9 @@ impl Encoder {
             mcu_count: 0,
             mcu_id: 0,
             mcu_mode: 0,
+            sdqt: [None, None],
+            sdht: [[None, None], [None, None]],
+            dri: 0,
         }
     }
 
@@ -272,7 +282,13 @@ impl Encoder {
                 for i in 0..self.marker_data[5] {
                     let dq = &self.marker_data[(i as usize * 3 + 6)..];
 
-                    debug!("DQT table for component {}: {}, Sampling factor: {}x{}", dq[0], dq[2], dq[1] & 0x0F, dq[1] >> 4);
+                    debug!(
+                        "DQT table for component {}: {}, Sampling factor: {}x{}",
+                        dq[0],
+                        dq[2],
+                        dq[1] & 0x0F,
+                        dq[1] >> 4
+                    );
 
                     // The first (Y) component must have a factor of 2x2, 2x1, 1x2, or 1x1
                     if i == 0 {
@@ -329,17 +345,107 @@ impl Encoder {
                     return Err(EncodeError::Components);
                 }
 
-                for i in 0.. self.marker_data[0] {
+                for i in 0..self.marker_data[0] {
                     let dh = &self.marker_data[i as usize * 2 + 1..];
                     debug!("Component {} DHT: {}", dh[0], dh[1]);
                 }
 
                 // Verify all of the DQT and DHT tables were loaded
-                if self.sdq
+                if self.sdqt[0].is_none() || (self.marker_data[0] > 1 && self.sdqt[1].is_none()) {
+                    return Err(EncodeError::Dqt);
+                }
+
+                if self.sdht[0][0].is_none()
+                    || (self.marker_data[0] > 1 && self.sdht[0][1].is_none())
+                    || self.sdht[1][0].is_none()
+                    || (self.marker_data[0] > 1 && self.sdht[1][1].is_none())
+                {
+                    return Err(EncodeError::Dht);
+                }
+
+                self.state = State::Huff;
+                return Ok(());
             }
+            J::Dht => {
+                while self.marker_data.len() > 0 {
+                    let mut len = 17;
+                    for i in 1..=16 {
+                        len += self.marker_data[i] as usize;
+                    }
+
+                    if self.marker_data.len() < len {
+                        return Err(EncodeError::MarkerLen);
+                    }
+
+                    let data = self.marker_data.drain(0..len);
+                    let drained = Vec::from_iter(data);
+                    match self.marker_data[0] {
+                        0x00 => self.sdht[0][0] = Some(drained),
+                        0x01 => self.sdht[0][1] = Some(drained),
+                        0x10 => self.sdht[1][0] = Some(drained),
+                        0x11 => self.sdht[1][1] = Some(drained),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            J::Dqt => {
+                while self.marker_data.len() > 0 {
+                    if self.marker_data.len() < 65 {
+                        return Err(EncodeError::MarkerLen);
+                    }
+
+                    let data = self.marker_data.drain(0..65);
+                    let drained = Vec::from_iter(data);
+
+                    match self.marker_data[0] {
+                        0x00 => self.sdqt[0] = Some(drained),
+                        0x01 => self.sdqt[1] = Some(drained),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            J::Dri => {
+                self.dri = ((self.marker_data[0] as u16) << 8) + (self.marker_data[1] as u16);
+                debug!("Reset interval: {} blocks", self.dri);
+            }
+            _ => {}
         }
 
         self.state = State::Marker;
+        Ok(())
+    }
+
+    fn process(&mut self) -> Result<(), EncodeError> {
+        if self.state == State::Huff {
+            if self.mcupart == 0 && self.acpart == 0 && self.next_reset_mcu > self.reset_mcu {
+                self.reset_mcu = self.next_reset_mcu;
+            }
+
+            let mut symbol = 0u8;
+            let mut 
+
+            if self.dht_lookup()
+        } else if self.state == State::Int {
+
+        }
+
+        if self.acpart >= 64 {
+            self.mcupart += 1;
+
+            if self.grayscale && self.mcupart == self.ycparts {
+                while self.mcupart < self.ycparts + 2 {
+                    self.component  = self.mcupart - self.ycparts + 1;
+
+                    self.acpart = 0;
+                    self.out_jpeg_int(0, 0);
+                    self.acpart = 1;
+                    self.out_jpeg_int(0, 0);
+
+                    self.mcupart += 1;
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -358,13 +464,15 @@ impl Iterator for Encoder {
                 State::Marker => {
                     self.marker = (self.marker << 8) | b as u16;
 
-                    if self.marker == JpegMarker::Tem || (self.marker >= JpegMarker::Rst0 && self.marker <= JpegMarker::Eoi) {
+                    if self.marker == JpegMarker::Tem
+                        || (self.marker >= JpegMarker::Rst0 && self.marker <= JpegMarker::Eoi)
+                    {
                         self.marker_len = 0;
                         if let Err(err) = self.have_marker() {
-                            return Some(Err(err))
+                            return Some(Err(err));
                         }
                     }
-                },
+                }
                 State::MarkerLen => {
                     self.marker_len = (self.marker_len << 8) | b as u16;
                     self.needbits -= 8;
@@ -372,23 +480,36 @@ impl Iterator for Encoder {
                     if self.needbits == 0 {
                         self.marker_len -= 2;
                         if let Err(err) = self.have_marker() {
-                            return Some(Err(err))
+                            return Some(Err(err));
                         }
                     }
-                },
+                }
                 State::MarkerData => {
                     self.marker_data.push(b);
-                    if self.marker_data.len() == self.marker_len {
+                    if self.marker_data.len() == self.marker_len.into() {
                         if let Err(err) = self.have_marker_data() {
                             return Some(Err(err));
                         }
                     }
                 }
+                State::Huff | State::Int => {
+                    if b == 0xFF {
+                        self.skip += 1;
+                    }
+
+                    self.workbits = (self.workbits << 8) | b as u32;
+                    self.worklen += 8;
+
+                    while let Ok(_) = self.process() {}
+
+
+                }
                 State::Eoi => return None,
+                _ => todo!(),
             }
         }
 
-        return Some(Ok(self.out.into_inner()))
+        return Some(Ok(self.out.into_inner()));
     }
 }
 
@@ -417,4 +538,12 @@ pub enum EncodeError {
     SamplingFactor,
     /// Maximum number of MCU blocks is 65535
     Blocks,
+    /// The image is missing one or more DQT tables
+    Dqt,
+    /// The image is missing one or more DHT tables
+    Dht,
+    /// The image has an invalid marker len
+    MarkerLen,
+    /// Reached the end of the image unexpecdedly
+    OutOfBits,
 }

@@ -39,7 +39,7 @@ pub(crate) enum JpegMarker {
     Dqt,
     Dnl,
     Dri,
-    DHP,
+    Dhp,
     Exp,
     App0,
     App1,
