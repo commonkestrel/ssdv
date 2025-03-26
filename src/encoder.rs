@@ -1,7 +1,9 @@
 // yeah i would probably document this if understood anything going on here
 // check out this if you'd like to learn more though: https://github.com/fsphil/ssdv
 
-use log::debug;
+use std::backtrace::Backtrace;
+
+use log::{debug, error};
 use tinyvec::ArrayVec;
 
 use crate::{JpegMarker, PacketType, Quality};
@@ -206,6 +208,8 @@ impl Encoder {
     }
 
     fn outbits(&mut self, bits: u16, len: u8) -> Result<(), EncodeError> {
+        debug!("outbits");
+
         if len > 0 {
             self.outbits <<= len.min(15);
             self.outbits |= bits & ((1 << len.min(15)) - 1);
@@ -430,14 +434,12 @@ impl Encoder {
 
     fn process(&mut self) -> Result<(), EncodeError> {
         if self.state == State::Huff {
+            debug!("process: huff");
             if self.mcupart == 0 && self.acpart == 0 && self.next_reset_mcu > self.reset_mcu {
                 self.reset_mcu = self.next_reset_mcu;
             }
 
-            let mut symbol = 0;
-            let mut width = 0;
-
-            self.dht_lookup(&mut symbol, &mut width)?;
+            let (symbol, width) = self.dht_lookup()?;
 
             if self.acpart == 0 {
                 // DC
@@ -474,11 +476,12 @@ impl Encoder {
                 }
             }
 
-            debug!("worklen - width = {} - {width} = {}", self.worklen, self.worklen - width);
             self.worklen -= width;
             self.workbits &= (1 << self.worklen.min(31)) - 1;
         } else if self.state == State::Int {
+            debug!("process: int");
             if self.worklen < self.needbits {
+                error!("out of bits in process! worklen: {}, needbits: {}", self.worklen, self.needbits);
                 return Err(EncodeError::OutOfBits);
             }
 
@@ -488,17 +491,20 @@ impl Encoder {
             );
 
             if self.acpart == 0 {
-                // DC
+                // DC   
                 if self.reset_mcu == self.mcu_id as u32
                     && (self.mcupart == 0 || self.mcupart >= self.ycparts)
                 {
                     self.dc[self.component as usize] += self.uadj(i);
                     self.adc[self.component as usize] = self.aadj(self.dc[self.component as usize]);
+
+                    debug!("out_jpeg_int from process int if");
                     self.out_jpeg_int(0, self.adc[self.component as usize])?;
                 } else {
                     self.dc[self.component as usize] += self.uadj(i);
 
                     i = self.aadj(self.dc[self.component as usize]);
+                    debug!("out_jpeg_int from process int else");
                     self.out_jpeg_int(0, i - self.adc[self.component as usize])?;
                     self.adc[self.component as usize] = i;
                 }
@@ -528,7 +534,6 @@ impl Encoder {
 
             self.state = State::Huff;
 
-            debug!("worklen - width = {} - {} = {}", self.worklen, self.needbits, self.worklen - self.needbits);
             self.worklen -= self.needbits;
             self.workbits &= (1 << self.worklen.min(31)) - 1;
         }
@@ -549,7 +554,10 @@ impl Encoder {
                 }
             }
 
+            // Reached the end of this MCU
+            debug!("close! mcupart: {}, ycparts: {}", self.mcupart, self.ycparts);
             if self.mcupart == self.ycparts + 2 {
+                debug!("finished MCU");
                 self.mcupart = 0;
                 self.mcu_id += 1;
 
@@ -582,24 +590,23 @@ impl Encoder {
         Ok(())
     }
 
-    fn dht_lookup(&mut self, symbol: &mut u8, width: &mut u8) -> Result<(), EncodeError> {
+    fn dht_lookup(&self) -> Result<(u8, u8), EncodeError> {
         let mut code = 0;
 
         let dht = self.sdht();
-        let mut ss = dht[17];
+        let mut ss = dht[17..].iter();
 
         for cw in 1..=16 {
             if cw > self.worklen {
+                error!("out of bits in dht_lookup: cw: {}, worklen: {}", cw, self.worklen);
                 return Err(EncodeError::OutOfBits);
             }
 
             for _ in (1..=dht[cw as usize]).rev() {
                 if self.workbits >> (self.worklen - cw).min(31) == code {
-                    *symbol = ss;
-                    *width = cw;
-                    return Ok(());
+                    return Ok((*ss.next().unwrap(), cw));
                 }
-                ss += 1;
+                ss.next();
                 code += 1;
             }
 
@@ -607,11 +614,12 @@ impl Encoder {
         }
 
         // No match found
+        error!("dht_lookup no match found!");
         return Err(EncodeError::NoMatch);
     }
 
     fn dht_lookup_symbol(
-        &mut self,
+        &self,
         symbol: u8,
         bits: &mut u16,
         width: &mut u8,
@@ -619,20 +627,15 @@ impl Encoder {
         let mut code = 0;
 
         let dht = self.ddht();
-        let mut ss = dht[17];
+        let mut ss = dht[17..].iter().peekable();
 
         for cw in 1..=16 {
-            if cw > self.worklen {
-                return Err(EncodeError::OutOfBits);
-            }
-
-            for _ in (1..=dht[cw as usize]).rev() {
-                if ss == symbol {
+            for n in (1..=dht[cw as usize]).rev() {
+                if ss.next().unwrap() == &symbol {
                     *bits = code;
                     *width = cw;
                     return Ok(());
                 }
-                ss += 1;
                 code += 1;
             }
 
@@ -640,6 +643,7 @@ impl Encoder {
         }
 
         // No match found
+        error!("dht_lookup_symbol no match found!");
         return Err(EncodeError::NoMatch);
     }
 
@@ -650,6 +654,7 @@ impl Encoder {
         let (intbits, intlen) = encode_int(value);
         self.dht_lookup_symbol((rle << 4) | (intlen & 0x0F), &mut huffbits, &mut hufflen)?;
 
+        debug!("outbits from out_jpeg_int, intlen: {intlen}, intbits: {intbits} rle: {rle}, value: {value}");
         self.outbits(huffbits, hufflen)?;
         if intlen > 0 {
             self.outbits(intbits as u16, intlen)?;
@@ -749,6 +754,10 @@ impl Iterator for Encoder {
     type Item = Result<[u8; PACKET_SIZE], EncodeError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.state == State::Eoi {
+            return None;
+        }
+
         while let Some(b) = self.image.next() {
             if self.skip > 0 {
                 self.skip -= 1;
@@ -797,10 +806,18 @@ impl Iterator for Encoder {
                     }
 
                     self.workbits = (self.workbits << 8) | b as u32;
-                    debug!("worklen: {}", self.worklen);
                     self.worklen += 8;
 
-                    while let Ok(_) = self.process() {}
+                    let mut r = self.process();
+                    while let Ok(_) = r {
+                        r = self.process();
+                    }
+
+                    error!("{r:?}");
+
+                    if matches!(r, Err(EncodeError::BufferFull | EncodeError::Eoi)) {
+
+                    }
                 }
                 State::Eoi => return None,
             }
@@ -822,19 +839,15 @@ const fn irdiv(mut i: isize, div: isize) -> isize {
 
 fn encode_int(mut value: isize) -> (isize, u8) {
     let mut bits = value;
-    let mut width = 0;
 
     value = value.abs();
-    while value > 0 {
-        width += 1;
-        value >>= 1;
-    }
+    let width = value.checked_ilog2().unwrap_or(0);
 
     if bits < 0 {
         bits = -bits ^ ((1 << width) - 1);
     }
 
-    return (bits, width);
+    return (bits, width as u8);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
