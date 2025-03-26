@@ -1,4 +1,9 @@
-use std::{fs::File, io::{Read, Write}, path::Path, process::ExitCode};
+use std::{
+    fs::File,
+    io::{Read, Write},
+    path::Path,
+    process::ExitCode,
+};
 
 use ssdv::Quality;
 
@@ -7,6 +12,8 @@ const IMAGE_ID: u8 = 1;
 const QUALITY: Quality = Quality::Q3;
 
 fn main() -> ExitCode {
+    env_logger::init();
+
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() != 3 {

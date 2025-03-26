@@ -101,7 +101,7 @@ pub struct Encoder {
     accrle: u8,
     mcupart: u8,
     reset_mcu: u32,
-    next_reset_mcu: u32, 
+    next_reset_mcu: u32,
     grayscale: bool,
     component: u8,
     ycparts: u8,
@@ -116,6 +116,8 @@ pub struct Encoder {
     sdqt: [Option<Vec<u8>>; 2],
     sdht: [[Option<Vec<u8>>; 2]; 2],
     dri: u16,
+    packet_mcu_id: u16,
+    packet_mcu_offset: u8,
 }
 
 impl Encoder {
@@ -166,6 +168,8 @@ impl Encoder {
             sdqt: [None, None],
             sdht: [[None, None], [None, None]],
             dri: 0,
+            packet_mcu_id: 0,
+            packet_mcu_offset: 0,
         }
     }
 
@@ -201,14 +205,14 @@ impl Encoder {
         return out;
     }
 
-    fn outbits(&mut self, bits: u16, len: u8) {
+    fn outbits(&mut self, bits: u16, len: u8) -> Result<(), EncodeError> {
         if len > 0 {
-            self.outbits <<= len;
-            self.outbits |= bits & ((1 << len) - 1);
+            self.outbits <<= len.min(15);
+            self.outbits |= bits & ((1 << len.min(15)) - 1);
             self.outlen += len;
         }
 
-        while self.outlen >= 8 && self.out.len() > 0 {
+        while self.outlen >= 8 {
             let b = self.outbits >> (self.outlen - 8);
 
             self.out.push(b as u8);
@@ -216,8 +220,14 @@ impl Encoder {
 
             if self.out_stuff && b == 0xFF {
                 self.outbits &= (1 << self.outlen) - 1;
-                self.outlen += 1;
+                self.outlen += 8;
             }
+        }
+
+        if self.out_len() > 0 {
+            return Ok(());
+        } else {
+            return Err(EncodeError::BufferFull);
         }
     }
 
@@ -377,9 +387,11 @@ impl Encoder {
                         return Err(EncodeError::MarkerLen);
                     }
 
+                    let tag = self.marker_data[0];
                     let data = self.marker_data.drain(0..len);
                     let drained = Vec::from_iter(data);
-                    match self.marker_data[0] {
+
+                    match tag {
                         0x00 => self.sdht[0][0] = Some(drained),
                         0x01 => self.sdht[0][1] = Some(drained),
                         0x10 => self.sdht[1][0] = Some(drained),
@@ -394,10 +406,11 @@ impl Encoder {
                         return Err(EncodeError::MarkerLen);
                     }
 
+                    let tag = self.marker_data[0];
                     let data = self.marker_data.drain(0..65);
                     let drained = Vec::from_iter(data);
 
-                    match self.marker_data[0] {
+                    match tag {
                         0x00 => self.sdqt[0] = Some(drained),
                         0x01 => self.sdqt[1] = Some(drained),
                         _ => unreachable!(),
@@ -421,12 +434,103 @@ impl Encoder {
                 self.reset_mcu = self.next_reset_mcu;
             }
 
-            let mut symbol = 0u8;
-            let mut 
+            let mut symbol = 0;
+            let mut width = 0;
 
-            if self.dht_lookup()
+            self.dht_lookup(&mut symbol, &mut width)?;
+
+            if self.acpart == 0 {
+                // DC
+                if symbol == 0x00 {
+                    // No change in DC from the last block
+                    if self.reset_mcu == self.mcu_id as u32
+                        && (self.mcupart == 0 || self.mcupart >= self.ycparts)
+                    {
+                        self.out_jpeg_int(0, self.adc[self.component as usize])?;
+                    } else {
+                        self.out_jpeg_int(0, 0)?;
+                    }
+
+                    // Skip to the next AC part immedietly
+                    self.acpart += 1;
+                } else {
+                    self.state = State::Int;
+                    self.needbits = symbol;
+                }
+            } else {
+                // AC
+                self.acrle = 0;
+                if symbol == 0x00 {
+                    self.out_jpeg_int(0, 0)?;
+                    self.acpart = 64;
+                } else if symbol == 0xF0 {
+                    self.out_jpeg_int(15, 0)?;
+                    self.acpart += 16;
+                } else {
+                    self.state = State::Int;
+                    self.acrle = symbol >> 4;
+                    self.acpart += self.acrle;
+                    self.needbits = symbol & 0x0F;
+                }
+            }
+
+            debug!("worklen - width = {} - {width} = {}", self.worklen, self.worklen - width);
+            self.worklen -= width;
+            self.workbits &= (1 << self.worklen.min(31)) - 1;
         } else if self.state == State::Int {
+            if self.worklen < self.needbits {
+                return Err(EncodeError::OutOfBits);
+            }
 
+            let mut i = self.int(
+                (self.workbits >> (self.worklen - self.needbits).min(31)) as isize,
+                self.needbits as isize,
+            );
+
+            if self.acpart == 0 {
+                // DC
+                if self.reset_mcu == self.mcu_id as u32
+                    && (self.mcupart == 0 || self.mcupart >= self.ycparts)
+                {
+                    self.dc[self.component as usize] += self.uadj(i);
+                    self.adc[self.component as usize] = self.aadj(self.dc[self.component as usize]);
+                    self.out_jpeg_int(0, self.adc[self.component as usize])?;
+                } else {
+                    self.dc[self.component as usize] += self.uadj(i);
+
+                    i = self.aadj(self.dc[self.component as usize]);
+                    self.out_jpeg_int(0, i - self.adc[self.component as usize])?;
+                    self.adc[self.component as usize] = i;
+                }
+            } else {
+                // AC
+                i = self.badj(i);
+                if i > 0 {
+                    self.accrle += self.acrle;
+                    while self.accrle >= 16 {
+                        self.out_jpeg_int(15, 0)?;
+                        self.accrle -= 16;
+                    }
+
+                    self.out_jpeg_int(self.accrle, i)?;
+                    self.accrle = 0;
+                } else {
+                    if self.acpart >= 63 {
+                        self.out_jpeg_int(0, 0)?;
+                        self.accrle = 0;
+                    } else {
+                        self.accrle += self.acrle + 1;
+                    }
+                }
+            }
+            
+            self.acpart += 1;
+
+            self.state = State::Huff;
+
+            debug!("worklen - width = {} - {} = {}", self.worklen, self.needbits, self.worklen - self.needbits);
+            self.worklen -= self.needbits;
+            self.workbits &= (1 << self.worklen.min(31)) - 1;
         }
 
         if self.acpart >= 64 {
@@ -434,19 +538,210 @@ impl Encoder {
 
             if self.grayscale && self.mcupart == self.ycparts {
                 while self.mcupart < self.ycparts + 2 {
-                    self.component  = self.mcupart - self.ycparts + 1;
+                    self.component = self.mcupart - self.ycparts + 1;
 
                     self.acpart = 0;
-                    self.out_jpeg_int(0, 0);
+                    self.out_jpeg_int(0, 0)?;
                     self.acpart = 1;
-                    self.out_jpeg_int(0, 0);
+                    self.out_jpeg_int(0, 0)?;
 
                     self.mcupart += 1;
                 }
             }
+
+            if self.mcupart == self.ycparts + 2 {
+                self.mcupart = 0;
+                self.mcu_id += 1;
+
+                if self.mcu_id >= self.mcu_count {
+                    self.outbits_sync()?;
+                    return Err(EncodeError::Eoi);
+                }
+
+                // Set the packet MCU marker
+                if self.packet_mcu_id == 0xFFFF {
+                    self.outbits_sync()?;
+
+                    self.next_reset_mcu = self.mcu_id as u32;
+                    self.packet_mcu_id = self.mcu_id;
+                    self.packet_mcu_offset =
+                        (PAYLOAD_SIZE - self.out.len() + ((self.outlen as usize + 7) / 8)) as u8;
+                }
+
+                if self.dri > 0 && self.mcu_id > 0 && self.mcu_id % self.dri == 0 {
+                    self.state = State::Marker;
+                    return Ok(());
+                }
+            }
+        }
+
+        if self.out_len() == 0 {
+            return Err(EncodeError::BufferFull);
         }
 
         Ok(())
+    }
+
+    fn dht_lookup(&mut self, symbol: &mut u8, width: &mut u8) -> Result<(), EncodeError> {
+        let mut code = 0;
+
+        let dht = self.sdht();
+        let mut ss = dht[17];
+
+        for cw in 1..=16 {
+            if cw > self.worklen {
+                return Err(EncodeError::OutOfBits);
+            }
+
+            for _ in (1..=dht[cw as usize]).rev() {
+                if self.workbits >> (self.worklen - cw).min(31) == code {
+                    *symbol = ss;
+                    *width = cw;
+                    return Ok(());
+                }
+                ss += 1;
+                code += 1;
+            }
+
+            code <<= 1;
+        }
+
+        // No match found
+        return Err(EncodeError::NoMatch);
+    }
+
+    fn dht_lookup_symbol(
+        &mut self,
+        symbol: u8,
+        bits: &mut u16,
+        width: &mut u8,
+    ) -> Result<(), EncodeError> {
+        let mut code = 0;
+
+        let dht = self.ddht();
+        let mut ss = dht[17];
+
+        for cw in 1..=16 {
+            if cw > self.worklen {
+                return Err(EncodeError::OutOfBits);
+            }
+
+            for _ in (1..=dht[cw as usize]).rev() {
+                if ss == symbol {
+                    *bits = code;
+                    *width = cw;
+                    return Ok(());
+                }
+                ss += 1;
+                code += 1;
+            }
+
+            code <<= 1;
+        }
+
+        // No match found
+        return Err(EncodeError::NoMatch);
+    }
+
+    fn out_jpeg_int(&mut self, rle: u8, value: isize) -> Result<(), EncodeError> {
+        let mut huffbits = 0;
+        let mut hufflen = 0;
+
+        let (intbits, intlen) = encode_int(value);
+        self.dht_lookup_symbol((rle << 4) | (intlen & 0x0F), &mut huffbits, &mut hufflen)?;
+
+        self.outbits(huffbits, hufflen)?;
+        if intlen > 0 {
+            self.outbits(intbits as u16, intlen)?;
+        }
+
+        return Ok(());
+    }
+
+    fn int(&self, mut bits: isize, width: isize) -> isize {
+        let b = (1 << width) - 1;
+        if bits <= b >> 1 {
+            bits = -(bits ^ b);
+        }
+
+        return bits;
+    }
+
+    fn outbits_sync(&mut self) -> Result<(), EncodeError> {
+        let b = self.outlen % 8;
+        if b > 0 {
+            return self.outbits(0xFF, 8 - b);
+        }
+
+        Ok(())
+    }
+
+    fn uadj(&self, i: isize) -> isize {
+        let sdqt = self.sdqt();
+        let ddqt = self.ddqt();
+
+        if sdqt == ddqt {
+            return i;
+        } else {
+            return i * sdqt as isize;
+        }
+    }
+
+    fn aadj(&self, i: isize) -> isize {
+        let sdqt = self.sdqt();
+        let ddqt = self.ddqt();
+
+        if sdqt == ddqt {
+            return i;
+        } else {
+            return irdiv(i, ddqt as isize);
+        }
+    }
+
+    fn badj(&self, i: isize) -> isize {
+        let sdqt = self.sdqt();
+        let ddqt = self.ddqt();
+
+        if sdqt == ddqt {
+            return i;
+        } else {
+            return irdiv(i * sdqt as isize, ddqt as isize);
+        }
+    }
+
+    fn sdqt(&self) -> u8 {
+        return self.sdqt[if self.component > 0 { 1 } else { 0 }]
+            .as_deref()
+            .map(|sdqt| sdqt[1 + self.acpart as usize])
+            .unwrap();
+    }
+
+    fn ddqt(&self) -> u8 {
+        if self.component > 1 {
+            return STD_DQT0[1 + self.acpart as usize];
+        } else {
+            return STD_DQT1[1 + self.acpart as usize];
+        }
+    }
+
+    fn sdht(&self) -> &[u8] {
+        return self.sdht[if self.acpart > 0 { 1 } else { 0 }]
+            [if self.component > 0 { 1 } else { 0 }]
+        .as_deref()
+        .unwrap_or(&[]);
+    }
+
+    fn ddht(&self) -> &[u8] {
+        match (self.acpart, self.component) {
+            (0, 0) => &STD_DHT00,
+            (0, _) => &STD_DHT01,
+            (_, 0) => &STD_DHT10,
+            (_, _) => &STD_DHT11,
+        }
+    }
+
+    fn out_len(&self) -> usize {
+        return self.out.capacity() - self.out.len();
     }
 }
 
@@ -471,6 +766,10 @@ impl Iterator for Encoder {
                         if let Err(err) = self.have_marker() {
                             return Some(Err(err));
                         }
+                    } else if self.marker >= JpegMarker::Sof0 && self.marker <= JpegMarker::Com {
+                        self.marker_len = 0;
+                        self.state = State::MarkerLen;
+                        self.needbits = 16;
                     }
                 }
                 State::MarkerLen => {
@@ -498,19 +797,44 @@ impl Iterator for Encoder {
                     }
 
                     self.workbits = (self.workbits << 8) | b as u32;
+                    debug!("worklen: {}", self.worklen);
                     self.worklen += 8;
 
                     while let Ok(_) = self.process() {}
-
-
                 }
                 State::Eoi => return None,
-                _ => todo!(),
             }
         }
 
         return Some(Ok(self.out.into_inner()));
     }
+}
+
+/// Integer-only division with rounding
+const fn irdiv(mut i: isize, div: isize) -> isize {
+    i = i * 2 / div;
+    if i & 1 > 0 {
+        i += i.signum();
+    }
+
+    return i / 2;
+}
+
+fn encode_int(mut value: isize) -> (isize, u8) {
+    let mut bits = value;
+    let mut width = 0;
+
+    value = value.abs();
+    while value > 0 {
+        width += 1;
+        value >>= 1;
+    }
+
+    if bits < 0 {
+        bits = -bits ^ ((1 << width) - 1);
+    }
+
+    return (bits, width);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -546,4 +870,9 @@ pub enum EncodeError {
     MarkerLen,
     /// Reached the end of the image unexpecdedly
     OutOfBits,
+    /// Reached the end of the image
+    Eoi,
+    /// No match found for huffman table
+    NoMatch,
+    BufferFull,
 }
