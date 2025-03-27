@@ -5,11 +5,12 @@ use std::{
     process::ExitCode,
 };
 
+use log::info;
 use ssdv::Quality;
 
 const CALLSIGN: &[u8; 6] = b"SOMETH";
-const IMAGE_ID: u8 = 1;
-const QUALITY: Quality = Quality::Q3;
+const IMAGE_ID: u8 = 0;
+const QUALITY: Quality = Quality::Q5;
 
 fn main() -> ExitCode {
     env_logger::init();
@@ -33,14 +34,23 @@ fn main() -> ExitCode {
     let output = Path::new(&args[2]);
     let mut out_file = File::create(output).expect("Unable to create output file");
 
+    let mut total = 0;
     for (i, chunk) in encoder.enumerate() {
         match chunk {
-            Ok(c) => out_file
-                .write_all(&c)
-                .expect("Unable to write to output file"),
+            Ok(c) => {
+                out_file
+                    .write_all(&c)
+                    .expect("Unable to write to output file");
+
+                // println!("{:?}", c);
+            }
             Err(err) => println!("Failed to encode chunk {i}: {err:?}"),
         }
+
+        total = i;
     }
+
+    info!("Wrote {total} packets");
 
     return ExitCode::SUCCESS;
 }

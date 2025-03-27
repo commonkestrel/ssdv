@@ -3,16 +3,16 @@
 
 use std::backtrace::Backtrace;
 
-use log::{debug, error};
-use tinyvec::ArrayVec;
+use log::{debug, error, info};
+use arrayvec::ArrayVec;
 
 use crate::{JpegMarker, PacketType, Quality};
 
 const PACKET_SIZE: usize = 256;
-const HEADER_SIZE: usize = 16;
+const HEADER_SIZE: usize = 15;
 const CRC_SIZE: usize = 4;
 const FEC_SIZE: usize = 32;
-const PAYLOAD_SIZE: usize = PACKET_SIZE - HEADER_SIZE - CRC_SIZE - CRC_SIZE;
+const PAYLOAD_SIZE: usize = PACKET_SIZE - HEADER_SIZE - CRC_SIZE;
 const CRCDATA_SIZE: usize = HEADER_SIZE + PAYLOAD_SIZE - 1;
 
 /// APP0 header data
@@ -88,9 +88,9 @@ pub struct Encoder {
     image: Box<dyn Iterator<Item = u8>>,
     dtbl0: [u8; 65],
     dtbl1: [u8; 65],
-    outbits: u16,
+    outbits: u32,
     outlen: u8,
-    out: ArrayVec<[u8; 256]>,
+    out: ArrayVec<u8, PAYLOAD_SIZE>,
     out_stuff: bool,
     skip: usize,
     marker: u16,
@@ -120,12 +120,13 @@ pub struct Encoder {
     dri: u16,
     packet_mcu_id: u16,
     packet_mcu_offset: u8,
+    packet_id: u16,
 }
 
 impl Encoder {
     pub fn new<C, I>(callsign: C, image_id: u8, quality: Quality, image: I) -> Self
     where
-        C: Into<ArrayVec<[u8; 6]>>,
+        C: Into<ArrayVec<u8, 6>>,
         I: IntoIterator<Item = u8>,
         <I as IntoIterator>::IntoIter: 'static,
     {
@@ -172,6 +173,7 @@ impl Encoder {
             dri: 0,
             packet_mcu_id: 0,
             packet_mcu_offset: 0,
+            packet_id: 0,
         }
     }
 
@@ -197,7 +199,7 @@ impl Encoder {
         let mut out: [u8; 65] = [0; 65];
 
         out[0] = table[0];
-        for (i, b) in table.iter().skip(1).copied().enumerate() {
+        for (i, b) in table.iter().copied().enumerate().skip(1) {
             let mut byte: u32 = (b as u32 * scale_factor as u32 + 50) / 100;
             byte = byte.clamp(1, 255);
 
@@ -208,15 +210,17 @@ impl Encoder {
     }
 
     fn outbits(&mut self, bits: u16, len: u8) -> Result<(), EncodeError> {
-        debug!("outbits");
-
         if len > 0 {
-            self.outbits <<= len.min(15);
-            self.outbits |= bits & ((1 << len.min(15)) - 1);
+            self.outbits <<= len;
+            self.outbits |= bits as u32 & ((1 << len) - 1);
             self.outlen += len;
         }
 
-        while self.outlen >= 8 {
+        println!("outbits -- bits: {bits}, len: {len}, outbits: {}, outlen: {}", self.outbits, self.outlen);
+
+        while self.outlen >= 8 && self.out_len() > 0 {
+            println!("outbits -- out_len: {}, bits: {bits}, len: {len}, outbits: {}, outlen: {}", self.out_len(), self.outbits, self.outlen);
+
             let b = self.outbits >> (self.outlen - 8);
 
             self.out.push(b as u8);
@@ -273,9 +277,9 @@ impl Encoder {
                 self.width = ((self.marker_data[3] as u16) << 8) | self.marker_data[4] as u16;
                 self.height = ((self.marker_data[1] as u16) << 8) | self.marker_data[2] as u16;
 
-                debug!("Precision: {}", self.marker_data[0]);
-                debug!("Resolution: {}x{}", self.width, self.height);
-                debug!("Components: {}", self.marker_data[5]);
+                info!("Precision: {}", self.marker_data[0]);
+                info!("Resolution: {}x{}", self.width, self.height);
+                info!("Components: {}", self.marker_data[5]);
 
                 if self.marker_data[0] != 8 {
                     return Err(EncodeError::Precision);
@@ -296,7 +300,7 @@ impl Encoder {
                 for i in 0..self.marker_data[5] {
                     let dq = &self.marker_data[(i as usize * 3 + 6)..];
 
-                    debug!(
+                    info!(
                         "DQT table for component {}: {}, Sampling factor: {}x{}",
                         dq[0],
                         dq[2],
@@ -344,7 +348,7 @@ impl Encoder {
                     _ => unreachable!(),
                 } as usize;
 
-                debug!("MCU blocks: {blocks}");
+                info!("MCU blocks: {blocks}");
 
                 if blocks > 0xFFFF {
                     return Err(EncodeError::Blocks);
@@ -353,7 +357,7 @@ impl Encoder {
                 self.mcu_count = blocks as u16;
             }
             J::Sos => {
-                debug!("Components: {}", self.marker_data[0]);
+                info!("Components: {}", self.marker_data[0]);
 
                 if self.marker_data[0] != 1 && self.marker_data[0] != 3 {
                     return Err(EncodeError::Components);
@@ -361,7 +365,7 @@ impl Encoder {
 
                 for i in 0..self.marker_data[0] {
                     let dh = &self.marker_data[i as usize * 2 + 1..];
-                    debug!("Component {} DHT: {}", dh[0], dh[1]);
+                    info!("Component {} DHT: {}", dh[0], dh[1]);
                 }
 
                 // Verify all of the DQT and DHT tables were loaded
@@ -423,7 +427,7 @@ impl Encoder {
             }
             J::Dri => {
                 self.dri = ((self.marker_data[0] as u16) << 8) + (self.marker_data[1] as u16);
-                debug!("Reset interval: {} blocks", self.dri);
+                info!("Reset interval: {} blocks", self.dri);
             }
             _ => {}
         }
@@ -434,12 +438,12 @@ impl Encoder {
 
     fn process(&mut self) -> Result<(), EncodeError> {
         if self.state == State::Huff {
-            debug!("process: huff");
             if self.mcupart == 0 && self.acpart == 0 && self.next_reset_mcu > self.reset_mcu {
                 self.reset_mcu = self.next_reset_mcu;
             }
 
             let (symbol, width) = self.dht_lookup()?;
+
 
             if self.acpart == 0 {
                 // DC
@@ -477,16 +481,14 @@ impl Encoder {
             }
 
             self.worklen -= width;
-            self.workbits &= (1 << self.worklen.min(31)) - 1;
+            self.workbits &= (1 << self.worklen) - 1;
         } else if self.state == State::Int {
-            debug!("process: int");
             if self.worklen < self.needbits {
-                error!("out of bits in process! worklen: {}, needbits: {}", self.worklen, self.needbits);
                 return Err(EncodeError::OutOfBits);
             }
 
             let mut i = self.int(
-                (self.workbits >> (self.worklen - self.needbits).min(31)) as isize,
+                (self.workbits >> (self.worklen - self.needbits)) as isize,
                 self.needbits as isize,
             );
 
@@ -498,20 +500,19 @@ impl Encoder {
                     self.dc[self.component as usize] += self.uadj(i);
                     self.adc[self.component as usize] = self.aadj(self.dc[self.component as usize]);
 
-                    debug!("out_jpeg_int from process int if");
                     self.out_jpeg_int(0, self.adc[self.component as usize])?;
                 } else {
                     self.dc[self.component as usize] += self.uadj(i);
 
                     i = self.aadj(self.dc[self.component as usize]);
-                    debug!("out_jpeg_int from process int else");
                     self.out_jpeg_int(0, i - self.adc[self.component as usize])?;
                     self.adc[self.component as usize] = i;
                 }
             } else {
                 // AC
                 i = self.badj(i);
-                if i > 0 {
+
+                if i != 0 {
                     self.accrle += self.acrle;
                     while self.accrle >= 16 {
                         self.out_jpeg_int(15, 0)?;
@@ -535,7 +536,7 @@ impl Encoder {
             self.state = State::Huff;
 
             self.worklen -= self.needbits;
-            self.workbits &= (1 << self.worklen.min(31)) - 1;
+            self.workbits &= (1 << self.worklen) - 1;
         }
 
         if self.acpart >= 64 {
@@ -555,9 +556,7 @@ impl Encoder {
             }
 
             // Reached the end of this MCU
-            debug!("close! mcupart: {}, ycparts: {}", self.mcupart, self.ycparts);
             if self.mcupart == self.ycparts + 2 {
-                debug!("finished MCU");
                 self.mcupart = 0;
                 self.mcu_id += 1;
 
@@ -573,7 +572,8 @@ impl Encoder {
                     self.next_reset_mcu = self.mcu_id as u32;
                     self.packet_mcu_id = self.mcu_id;
                     self.packet_mcu_offset =
-                        (PAYLOAD_SIZE - self.out.len() + ((self.outlen as usize + 7) / 8)) as u8;
+                        (PAYLOAD_SIZE - self.out_len() + ((self.outlen as usize + 7) / 8)) as u8;
+                    debug!("setting mcu_offset - out_len: {}, outlen: {}, packet_mcu_offset: {}", self.out_len(), self.outlen, self.packet_mcu_offset);
                 }
 
                 if self.dri > 0 && self.mcu_id > 0 && self.mcu_id % self.dri == 0 {
@@ -581,6 +581,15 @@ impl Encoder {
                     return Ok(());
                 }
             }
+
+            if self.mcupart < self.ycparts {
+                self.component = 0;
+            } else {
+                self.component = self.mcupart - self.ycparts + 1;
+            }
+
+            self.acpart = 0;
+            self.accrle = 0;
         }
 
         if self.out_len() == 0 {
@@ -598,12 +607,11 @@ impl Encoder {
 
         for cw in 1..=16 {
             if cw > self.worklen {
-                error!("out of bits in dht_lookup: cw: {}, worklen: {}", cw, self.worklen);
                 return Err(EncodeError::OutOfBits);
             }
 
             for _ in (1..=dht[cw as usize]).rev() {
-                if self.workbits >> (self.worklen - cw).min(31) == code {
+                if self.workbits >> (self.worklen - cw) == code {
                     return Ok((*ss.next().unwrap(), cw));
                 }
                 ss.next();
@@ -654,7 +662,6 @@ impl Encoder {
         let (intbits, intlen) = encode_int(value);
         self.dht_lookup_symbol((rle << 4) | (intlen & 0x0F), &mut huffbits, &mut hufflen)?;
 
-        debug!("outbits from out_jpeg_int, intlen: {intlen}, intbits: {intbits} rle: {rle}, value: {value}");
         self.outbits(huffbits, hufflen)?;
         if intlen > 0 {
             self.outbits(intbits as u16, intlen)?;
@@ -722,10 +729,10 @@ impl Encoder {
     }
 
     fn ddqt(&self) -> u8 {
-        if self.component > 1 {
-            return STD_DQT0[1 + self.acpart as usize];
+        if self.component > 0 {
+            return self.dtbl1[1 + self.acpart as usize];
         } else {
-            return STD_DQT1[1 + self.acpart as usize];
+            return self.dtbl0[1 + self.acpart as usize];
         }
     }
 
@@ -813,17 +820,77 @@ impl Iterator for Encoder {
                         r = self.process();
                     }
 
-                    error!("{r:?}");
-
                     if matches!(r, Err(EncodeError::BufferFull | EncodeError::Eoi)) {
+                        let mut mcu_id = self.packet_mcu_id;
+                        let mut mcu_offset = self.packet_mcu_offset;
 
+                        if mcu_offset != 0xFF && mcu_offset >= PAYLOAD_SIZE as u8 {
+                            // The first MCU begins in the next packet, not this one
+                            mcu_id = 0xFFFF;
+                            mcu_offset = 0xFF;
+                            self.packet_mcu_offset -= PAYLOAD_SIZE as u8;
+                        } else {
+                            // Clear the MCU data for the next packet
+                            self.packet_mcu_id = 0xFFFF;
+                            self.packet_mcu_offset = 0xFF;
+                        }
+
+                        let callsign = self.callsign.to_be_bytes();
+
+                        let mut output = [0; PACKET_SIZE];
+                        output[0] = 0x55; // Sync
+                        output[1] = 0x67; // No-FEC mode
+                        output[2] = callsign[0];
+                        output[3] = callsign[1];
+                        output[4] = callsign[2];
+                        output[5] = callsign[3];
+                        output[6] = self.image_id;
+                        output[7] = (self.packet_id >> 8) as u8;
+                        output[8] = (self.packet_id & 0xFF) as u8;
+                        output[9] = (self.width >> 4) as u8; // Width / 16
+                        output[10] = (self.height >> 4) as u8; // Height / 16
+                        output[11] |= ((self.quality.num().wrapping_sub(4)) & 7) << 3; // Quality level
+                        output[11] |= (if matches!(r, Err(EncodeError::Eoi)) { 1 } else { 0 }) << 2; // EOI flag (1 bit)
+                        output[11] |= self.mcu_mode & 0x03; // MCU mode (2 bits)
+                        output[12] = mcu_offset;
+                        output[13] = (mcu_id >> 8) as u8;
+                        output[14] = (mcu_id & 0xFF) as u8;
+
+                        debug!("mcu_offset: {mcu_offset}");
+
+                        let free = self.out_len();
+                        let drain = self.out.drain(0..);
+                        for (i, b) in drain.enumerate() {
+                            output[i + HEADER_SIZE] = b;
+                        }
+
+                        let mut l: u8 = 0x00;
+                        for n in 0..free {
+                            let i = HEADER_SIZE + PAYLOAD_SIZE - free + n;
+                            l = l.wrapping_mul(254).wrapping_add(45); // A very simple PRNG for noise whitening
+                            output[i] = l;
+                        }
+
+                        let crc = crc32(&output[1..=CRCDATA_SIZE]);
+
+                        output[1 + CRCDATA_SIZE..].copy_from_slice(&crc.to_be_bytes());
+
+                        self.packet_id += 1;
+
+                        if matches!(r, Err(EncodeError::Eoi)) {
+                            self.state = State::Eoi;
+                        }
+
+                        return Some(Ok(output));
+                    } else if !matches!(r, Err(EncodeError::OutOfBits)) {
+                        return Some(Err(r.unwrap_err()));
                     }
                 }
                 State::Eoi => return None,
             }
         }
 
-        return Some(Ok(self.out.into_inner()));
+        return Some(Err(EncodeError::OutOfBits));
     }
 }
 
@@ -841,13 +908,31 @@ fn encode_int(mut value: isize) -> (isize, u8) {
     let mut bits = value;
 
     value = value.abs();
-    let width = value.checked_ilog2().unwrap_or(0);
+    let width = value.checked_ilog2().map(|width| width + 1).unwrap_or(0);
 
     if bits < 0 {
         bits = -bits ^ ((1 << width) - 1);
     }
 
     return (bits, width as u8);
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFFFFFF;
+    
+    for b in data {
+        let mut x = crc & 0xFF ^ *b as u32; 
+        for _ in 0..8 {
+            if x & 1 > 0 {
+                x = (x >> 1) ^ 0xEDB88320; // oh boy magic numbers
+            } else {
+                x >>= 1;
+            }
+        }
+        crc = (crc >> 8) ^x;
+    }
+
+    return crc ^ 0xFFFFFFFF;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

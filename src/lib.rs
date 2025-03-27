@@ -135,8 +135,12 @@ impl Quality {
     const DQT_SCALES: [u16; 8] = [5000, 357, 172, 116, 100, 58, 28, 0];
 
     pub fn scale_factor(&self) -> u16 {
-        let num: u8 = unsafe { std::mem::transmute_copy(self) };
+        let num = self.num();
         return Self::DQT_SCALES[num as usize];
+    }
+
+    pub fn num(&self) -> u8 {
+        unsafe { std::mem::transmute_copy(self) }
     }
 }
 
