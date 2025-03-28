@@ -216,10 +216,10 @@ impl Encoder {
             self.outlen += len;
         }
 
-        println!("outbits -- bits: {bits}, len: {len}, outbits: {}, outlen: {}", self.outbits, self.outlen);
+        println!("open outbits -- out_len: {}, bits: {bits}, len: {len}, outbits: {}, outlen: {}", self.out_len(), self.outbits, self.outlen);
 
         while self.outlen >= 8 && self.out_len() > 0 {
-            println!("outbits -- out_len: {}, bits: {bits}, len: {len}, outbits: {}, outlen: {}", self.out_len(), self.outbits, self.outlen);
+            println!("loop begin outbits -- out_len: {}, bits: {bits}, len: {len}, outbits: {}, outlen: {}", self.out_len(), self.outbits, self.outlen);
 
             let b = self.outbits >> (self.outlen - 8);
 
@@ -230,6 +230,9 @@ impl Encoder {
                 self.outbits &= (1 << self.outlen) - 1;
                 self.outlen += 8;
             }
+
+
+            println!("loop end outbits -- out_len: {}, bits: {bits}, len: {len}, outbits: {}, outlen: {}", self.out_len(), self.outbits, self.outlen);
         }
 
         if self.out_len() > 0 {
@@ -452,8 +455,10 @@ impl Encoder {
                     if self.reset_mcu == self.mcu_id as u32
                         && (self.mcupart == 0 || self.mcupart >= self.ycparts)
                     {
+                        println!("huff dc no change out_jpeg_int with component {}", self.component);
                         self.out_jpeg_int(0, self.adc[self.component as usize])?;
                     } else {
+                        println!("huff dc changed out_jpeg_int with component {}", self.component);
                         self.out_jpeg_int(0, 0)?;
                     }
 
@@ -467,12 +472,17 @@ impl Encoder {
                 // AC
                 self.acrle = 0;
                 if symbol == 0x00 {
+                    // EOB -- all remaining Ac parts are zero
+                    println!("huff ac EOB out_jpeg_int with component {}", self.component);
                     self.out_jpeg_int(0, 0)?;
                     self.acpart = 64;
                 } else if symbol == 0xF0 {
+                    // The next 16 AC parts are zero
+                    println!("huff ac zeroed out_jpeg_int with component {}", self.component);
                     self.out_jpeg_int(15, 0)?;
                     self.acpart += 16;
                 } else {
+                    // The next bits are an integer value
                     self.state = State::Int;
                     self.acrle = symbol >> 4;
                     self.acpart += self.acrle;
@@ -497,13 +507,17 @@ impl Encoder {
                 if self.reset_mcu == self.mcu_id as u32
                     && (self.mcupart == 0 || self.mcupart >= self.ycparts)
                 {
+                    // Output absolute DC value
                     self.dc[self.component as usize] += self.uadj(i);
                     self.adc[self.component as usize] = self.aadj(self.dc[self.component as usize]);
-
+                    println!("int dc reset mcu out_jpeg_int with component {}", self.component);
                     self.out_jpeg_int(0, self.adc[self.component as usize])?;
                 } else {
+                    // Out relative DC value
                     self.dc[self.component as usize] += self.uadj(i);
+                    println!("int dc not mcu out_jpeg_int with component {}", self.component);
 
+                    // Calculate closes
                     i = self.aadj(self.dc[self.component as usize]);
                     self.out_jpeg_int(0, i - self.adc[self.component as usize])?;
                     self.adc[self.component as usize] = i;
@@ -519,10 +533,12 @@ impl Encoder {
                         self.accrle -= 16;
                     }
 
+                    println!("int ac accrle out_jpeg_int with component {}", self.component);
                     self.out_jpeg_int(self.accrle, i)?;
                     self.accrle = 0;
                 } else {
                     if self.acpart >= 63 {
+                        println!("int ac acpart out_jpeg_int with component {}", self.component);
                         self.out_jpeg_int(0, 0)?;
                         self.accrle = 0;
                     } else {
@@ -573,7 +589,6 @@ impl Encoder {
                     self.packet_mcu_id = self.mcu_id;
                     self.packet_mcu_offset =
                         (PAYLOAD_SIZE - self.out_len() + ((self.outlen as usize + 7) / 8)) as u8;
-                    debug!("setting mcu_offset - out_len: {}, outlen: {}, packet_mcu_offset: {}", self.out_len(), self.outlen, self.packet_mcu_offset);
                 }
 
                 if self.dri > 0 && self.mcu_id > 0 && self.mcu_id % self.dri == 0 {
@@ -662,8 +677,10 @@ impl Encoder {
         let (intbits, intlen) = encode_int(value);
         self.dht_lookup_symbol((rle << 4) | (intlen & 0x0F), &mut huffbits, &mut hufflen)?;
 
+        println!("outbits huff -- component: {}, rle: {rle}, value: {value}, huffbits: {huffbits}, hufflen: {hufflen}", self.component);
         self.outbits(huffbits, hufflen)?;
         if intlen > 0 {
+            println!("outbits int -- component: {}, rle: {rle}, value: {value}, intbits: {intbits}, intlen: {intlen}", self.component);
             self.outbits(intbits as u16, intlen)?;
         }
 
@@ -863,6 +880,8 @@ impl Iterator for Encoder {
                         for (i, b) in drain.enumerate() {
                             output[i + HEADER_SIZE] = b;
                         }
+                        println!("flushing outbits for new buffer");
+                        let _ = self.outbits(0, 0);
 
                         let mut l: u8 = 0x00;
                         for n in 0..free {

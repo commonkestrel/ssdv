@@ -10,7 +10,7 @@ use ssdv::Quality;
 
 const CALLSIGN: &[u8; 6] = b"SOMETH";
 const IMAGE_ID: u8 = 0;
-const QUALITY: Quality = Quality::Q5;
+const QUALITY: Quality = Quality::Q4;
 
 fn main() -> ExitCode {
     env_logger::init();
