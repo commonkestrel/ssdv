@@ -10,10 +10,10 @@ use ssdv::Quality;
 
 const CALLSIGN: &[u8; 6] = b"SOMETH";
 const IMAGE_ID: u8 = 0;
-const QUALITY: Quality = Quality::Q4;
+const QUALITY: Quality = Quality::Q3;
 
 fn main() -> ExitCode {
-    env_logger::init();
+    env_logger::builder().filter_level(log::LevelFilter::Debug).init();
 
     let args: Vec<String> = std::env::args().collect();
 
