@@ -384,6 +384,7 @@ impl Encoder {
                     return Err(EncodeError::Dht);
                 }
 
+                // The SOS data is followed by the image data
                 self.state = State::Huff;
                 return Ok(());
             }
@@ -441,6 +442,7 @@ impl Encoder {
 
     fn process(&mut self) -> Result<(), EncodeError> {
         if self.state == State::Huff {
+            println!("process: huff");
             if self.mcupart == 0 && self.acpart == 0 && self.next_reset_mcu > self.reset_mcu {
                 self.reset_mcu = self.next_reset_mcu;
             }
@@ -456,15 +458,17 @@ impl Encoder {
                         && (self.mcupart == 0 || self.mcupart >= self.ycparts)
                     {
                         println!("huff dc no change out_jpeg_int with component {}", self.component);
-                        self.out_jpeg_int(0, self.adc[self.component as usize])?;
+                        let _ = self.out_jpeg_int(0, self.adc[self.component as usize]);
                     } else {
                         println!("huff dc changed out_jpeg_int with component {}", self.component);
-                        self.out_jpeg_int(0, 0)?;
+                        let _ = self.out_jpeg_int(0, 0);
                     }
 
                     // Skip to the next AC part immedietly
                     self.acpart += 1;
                 } else {
+                    // DC value follows, 'symbol' bits wide
+                    println!("dc value follows");
                     self.state = State::Int;
                     self.needbits = symbol;
                 }
@@ -474,15 +478,16 @@ impl Encoder {
                 if symbol == 0x00 {
                     // EOB -- all remaining Ac parts are zero
                     println!("huff ac EOB out_jpeg_int with component {}", self.component);
-                    self.out_jpeg_int(0, 0)?;
+                    let _ = self.out_jpeg_int(0, 0);
                     self.acpart = 64;
                 } else if symbol == 0xF0 {
                     // The next 16 AC parts are zero
                     println!("huff ac zeroed out_jpeg_int with component {}", self.component);
-                    self.out_jpeg_int(15, 0)?;
+                    let _ = self.out_jpeg_int(15, 0);
                     self.acpart += 16;
                 } else {
                     // The next bits are an integer value
+                    println!("integer value follows");
                     self.state = State::Int;
                     self.acrle = symbol >> 4;
                     self.acpart += self.acrle;
@@ -493,6 +498,7 @@ impl Encoder {
             self.worklen -= width;
             self.workbits &= (1 << self.worklen) - 1;
         } else if self.state == State::Int {
+            println!("process: int");
             if self.worklen < self.needbits {
                 return Err(EncodeError::OutOfBits);
             }
@@ -511,15 +517,15 @@ impl Encoder {
                     self.dc[self.component as usize] += self.uadj(i);
                     self.adc[self.component as usize] = self.aadj(self.dc[self.component as usize]);
                     println!("int dc reset mcu out_jpeg_int with component {}", self.component);
-                    self.out_jpeg_int(0, self.adc[self.component as usize])?;
+                    let _ = self.out_jpeg_int(0, self.adc[self.component as usize]);
                 } else {
                     // Out relative DC value
                     self.dc[self.component as usize] += self.uadj(i);
                     println!("int dc not mcu out_jpeg_int with component {}", self.component);
 
-                    // Calculate closes
+                    // Calculate closest adjusted DC value
                     i = self.aadj(self.dc[self.component as usize]);
-                    self.out_jpeg_int(0, i - self.adc[self.component as usize])?;
+                    let _ = self.out_jpeg_int(0, i - self.adc[self.component as usize]);
                     self.adc[self.component as usize] = i;
                 }
             } else {
@@ -529,17 +535,17 @@ impl Encoder {
                 if i != 0 {
                     self.accrle += self.acrle;
                     while self.accrle >= 16 {
-                        self.out_jpeg_int(15, 0)?;
+                        let _ = self.out_jpeg_int(15, 0);
                         self.accrle -= 16;
                     }
 
                     println!("int ac accrle out_jpeg_int with component {}", self.component);
-                    self.out_jpeg_int(self.accrle, i)?;
+                    let _ = self.out_jpeg_int(self.accrle, i);
                     self.accrle = 0;
                 } else {
                     if self.acpart >= 63 {
                         println!("int ac acpart out_jpeg_int with component {}", self.component);
-                        self.out_jpeg_int(0, 0)?;
+                        let _ = self.out_jpeg_int(0, 0);
                         self.accrle = 0;
                     } else {
                         self.accrle += self.acrle + 1;
@@ -547,8 +553,10 @@ impl Encoder {
                 }
             }
             
+            // Next AC part to expect
             self.acpart += 1;
 
+            // Next bits are a huffman code
             self.state = State::Huff;
 
             self.worklen -= self.needbits;
@@ -563,9 +571,9 @@ impl Encoder {
                     self.component = self.mcupart - self.ycparts + 1;
 
                     self.acpart = 0;
-                    self.out_jpeg_int(0, 0)?;
+                    let _ = self.out_jpeg_int(0, 0);
                     self.acpart = 1;
-                    self.out_jpeg_int(0, 0)?;
+                    let _ = self.out_jpeg_int(0, 0);
 
                     self.mcupart += 1;
                 }
@@ -577,13 +585,13 @@ impl Encoder {
                 self.mcu_id += 1;
 
                 if self.mcu_id >= self.mcu_count {
-                    self.outbits_sync()?;
+                    let _ = self.outbits_sync();
                     return Err(EncodeError::Eoi);
                 }
 
                 // Set the packet MCU marker
                 if self.packet_mcu_id == 0xFFFF {
-                    self.outbits_sync()?;
+                    let _ = self.outbits_sync();
 
                     self.next_reset_mcu = self.mcu_id as u32;
                     self.packet_mcu_id = self.mcu_id;
@@ -677,8 +685,8 @@ impl Encoder {
         let (intbits, intlen) = encode_int(value);
         self.dht_lookup_symbol((rle << 4) | (intlen & 0x0F), &mut huffbits, &mut hufflen)?;
 
-        println!("outbits huff -- component: {}, rle: {rle}, value: {value}, huffbits: {huffbits}, hufflen: {hufflen}", self.component);
-        self.outbits(huffbits, hufflen)?;
+        println!("outbits huff -- component: {}, rle: {rle}, value: {value}, huffbits: {huffbits}, hufflen: {hufflen}, intbits: {intbits}, intlen: {intlen}", self.component);
+        let _ = self.outbits(huffbits, hufflen);
         if intlen > 0 {
             println!("outbits int -- component: {}, rle: {rle}, value: {value}, intbits: {intbits}, intlen: {intlen}", self.component);
             self.outbits(intbits as u16, intlen)?;
@@ -838,6 +846,7 @@ impl Iterator for Encoder {
                     }
 
                     if matches!(r, Err(EncodeError::BufferFull | EncodeError::Eoi)) {
+                        println!("buffer full or end of image");
                         let mut mcu_id = self.packet_mcu_id;
                         let mut mcu_offset = self.packet_mcu_offset;
 
@@ -904,6 +913,8 @@ impl Iterator for Encoder {
                     } else if !matches!(r, Err(EncodeError::OutOfBits)) {
                         return Some(Err(r.unwrap_err()));
                     }
+
+                    println!("out of bits");
                 }
                 State::Eoi => return None,
             }
